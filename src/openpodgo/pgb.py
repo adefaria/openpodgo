@@ -12,6 +12,8 @@ names, values in real units, and controller ranges.
 from __future__ import annotations
 
 import json
+import re
+import zipfile
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,7 +72,7 @@ def _zlib_streams(data: bytes, start: int = 0):
         pos = idx + (len(data) - idx - len(dec.unused_data))
 
 
-def read_backup(path: Path) -> Backup:
+def read_backup(path: Path | str) -> Backup:
     """Parse a .pgb. Raises ValueError if the file is not an AF6L backup."""
     data = Path(path).read_bytes()
     if data[:4] != MAGIC:
@@ -92,6 +94,107 @@ def read_backup(path: Path) -> Backup:
     if not setlists:
         raise ValueError(f"{path}: backup without L6Setlist setlists")
     return Backup(globals=globals_, setlists=setlists)
+
+
+def write_backup(
+    path: Path | str,
+    backup: Backup,
+    irs: list[bytes] | None = None,
+) -> None:
+    """Serialize a Backup into an AF6L .pgb container file.
+
+    Raises ValueError if backup has no setlists.
+    """
+    if not backup.setlists:
+        raise ValueError("Cannot write backup without at least one setlist")
+
+    # Header: AF6L magic + 12-byte zero container padding
+    chunks = [MAGIC + b"\x00" * 12]
+
+    # 1. Globals stream (if provided)
+    if backup.globals:
+        globals_json = json.dumps(backup.globals, separators=(",", ":")).encode("utf-8")
+        chunks.append(zlib.compress(globals_json))
+
+    # 2. Setlist streams (Factory, User, etc.)
+    for name, presets in backup.setlists.items():
+        doc = {
+            "schema": "L6Setlist",
+            "version": 6,
+            "data": {
+                "meta": {"name": name},
+                "presets": presets,
+            },
+        }
+        setlist_json = json.dumps(doc, separators=(",", ":")).encode("utf-8")
+        chunks.append(zlib.compress(setlist_json))
+
+    # 3. Optional IR streams (raw WAV or binary)
+    if irs:
+        for ir_bytes in irs:
+            chunks.append(zlib.compress(ir_bytes))
+
+    Path(path).write_bytes(b"".join(chunks))
+
+
+def _sanitize_filename(name: str) -> str:
+    cleaned = re.sub(r'[\\/*?:"<>|]', "", name).strip()
+    return cleaned.replace(" ", "_") or "preset"
+
+
+def export_presets_zip(
+    path: Path | str,
+    presets_by_setlist: dict[str, list[dict]],
+) -> None:
+    """Export presets into a .zip archive organized into setlist subfolders."""
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for setlist_name, presets in presets_by_setlist.items():
+            folder = _sanitize_filename(setlist_name)
+            for idx, p in enumerate(presets):
+                if not p:
+                    continue
+                p_name = p.get("meta", {}).get("name") or f"preset_{idx:03d}"
+                clean_name = _sanitize_filename(p_name)
+                filename = f"{folder}/{idx:03d}_{clean_name}.pgp"
+                if "schema" in p:
+                    doc = p
+                else:
+                    doc = {
+                        "schema": "L6Preset",
+                        "version": 6,
+                        "data": p,
+                    }
+                content = json.dumps(doc, indent=2).encode("utf-8")
+                zf.writestr(filename, content)
+
+
+def import_presets_zip(path: Path | str) -> dict[str, list[dict]]:
+    """Import presets from a .zip archive containing .pgp files.
+
+    Returns a mapping of setlist_name -> list of preset dicts.
+    Raises ValueError if path is not a valid zip archive.
+    """
+    try:
+        zf = zipfile.ZipFile(path, "r")
+    except (zipfile.BadZipFile, IsADirectoryError, FileNotFoundError) as err:
+        raise ValueError(f"{path}: not a valid zip archive ({err})") from err
+
+    with zf:
+        setlists: dict[str, list[dict]] = {}
+        for name in sorted(zf.namelist()):
+            if not name.endswith(".pgp"):
+                continue
+            parts = name.split("/")
+            setlist_name = parts[0] if len(parts) > 1 else "User"
+            try:
+                raw = zf.read(name)
+                doc = json.loads(raw)
+            except Exception:
+                continue
+            preset_data = doc.get("data") if doc.get("schema") == "L6Preset" else doc
+            setlists.setdefault(setlist_name, []).append(preset_data)
+
+        return setlists
 
 
 def block_params(block: dict) -> dict:
