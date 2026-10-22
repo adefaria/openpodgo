@@ -9,25 +9,27 @@ pedal actually changed before re-reading the active preset.
 
 from __future__ import annotations
 
-import logging
 import datetime
-import time
+import logging
 from pathlib import Path
+import time
 
-from PySide6.QtCore import QThread, QTimer, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
-    QMainWindow,
     QFileDialog,
+    QLineEdit,
+    QMainWindow,
     QMessageBox,
     QProgressDialog,
     QSplitter,
     QStatusBar,
+    QTextEdit,
 )
 
+from .. import pgb, preset
 from ..device import PodGo
-from .. import pgb
 from ..editor import PresetEditor
 from ..midi import MidiError, MidiOut
 from ..notifications import NotificationReader
@@ -43,24 +45,6 @@ log = logging.getLogger(__name__)
 RECALL_SETTLE_S = 0.3
 RECALL_RETRIES = 4
 
-
-
-
-class ProgressWorker(QThread):
-    done = Signal(object)
-    failed = Signal(str)
-    progress = Signal(int, int, str)
-
-    def __init__(self, fn) -> None:
-        super().__init__()
-        self._fn = fn
-
-    def run(self) -> None:
-        try:
-            res = self._fn(lambda cur, tot, msg: self.progress.emit(cur, tot, msg))
-            self.done.emit(res)
-        except Exception as exc:
-            self.failed.emit(str(exc))
 
 class Worker(QThread):
     """Runs a function (that touches USB) off the UI thread."""
@@ -79,10 +63,28 @@ class Worker(QThread):
             self.failed.emit(str(exc))
 
 
+class ProgressWorker(QThread):
+    """Runs a function off the UI thread with progress callbacks."""
+
+    progress = Signal(int, int, str)
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn) -> None:
+        super().__init__()
+        self._fn = fn
+
+    def run(self) -> None:
+        try:
+            self.done.emit(self._fn(self.progress.emit))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self, autoconnect: bool = True) -> None:
         super().__init__()
-        self.setWindowTitle("openpodgo")
+        self.setWindowTitle("OpenPodGo")
         self.resize(1280, 720)
 
         self.device = PodGo()
@@ -113,9 +115,11 @@ class MainWindow(QMainWindow):
         #: flushed when the worker finishes instead of being dropped (issue #2,
         #: e.g. two quick bypass toggles).
         self._chain_write_pending = False
+        self._busy_depth = 0
 
         self._build_ui()
         self._build_menu()
+
         if autoconnect:
             self._start_connect()
         else:
@@ -130,16 +134,29 @@ class MainWindow(QMainWindow):
         self.librarian.refresh_requested.connect(self._reload_presets)
         self.librarian.reconnect_requested.connect(lambda: self._start_connect())
         self.librarian.import_requested.connect(self._import_preset_to)
+        self.librarian.export_requested.connect(self._export_preset_at)
+        self.librarian.rename_requested.connect(self._rename_preset)
+        self.librarian.rename_committed.connect(
+            lambda slot, name: self._commit_preset_rename(slot, name)
+        )
+        self.librarian.preset_dropped.connect(self._import_pgp_file_to)
+        self.librarian.reset_requested.connect(self._reset_preset)
 
         self.editor_view = EditorView()
         self.editor_view.setEnabled(False)  # until a preset is loaded
-        self.editor_view.reread_requested.connect(self._open_editor)
         self.editor_view.save_requested.connect(self._save_to_pedal)
+        self.editor_view.import_requested.connect(self._import_preset)
         self.editor_view.bypass_midi_sent.connect(self._on_bypass_midi)
         self.editor_view.snapshot_selected.connect(self._on_snapshot)
         self.editor_view.chain_write_requested.connect(self._write_chain_to_pedal)
         self.editor_view.prev_requested.connect(lambda: self._step_preset(-1))
         self.editor_view.next_requested.connect(lambda: self._step_preset(+1))
+        self.editor_view.rename_requested.connect(self._on_toolbar_rename)
+        self.editor_view.file_dropped.connect(
+            lambda path: self._import_pgp_file_to(
+                self.librarian.loaded if self.librarian.loaded is not None else 0, path
+            )
+        )
 
         splitter = QSplitter()
         splitter.addWidget(self.librarian)
@@ -159,29 +176,52 @@ class MainWindow(QMainWindow):
         act_export = QAction("&Export preset…", self)
         act_export.triggered.connect(self._export_preset)
         file_menu.addAction(act_export)
+
         file_menu.addSeparator()
         act_create_backup = QAction("&Create backup…", self)
         act_create_backup.triggered.connect(self._create_backup)
         file_menu.addAction(act_create_backup)
+
         act_restore_backup = QAction("&Restore from backup…", self)
         act_restore_backup.triggered.connect(self._restore_backup)
         file_menu.addAction(act_restore_backup)
+
         file_menu.addSeparator()
         act_export_zip = QAction("Export presets archive (.zip)…", self)
         act_export_zip.triggered.connect(self._export_presets_zip)
         file_menu.addAction(act_export_zip)
+
         act_import_zip = QAction("Import presets archive (.zip)…", self)
         act_import_zip.triggered.connect(self._import_presets_zip)
         file_menu.addAction(act_import_zip)
+
         file_menu.addSeparator()
         act_quit = QAction("&Quit", self)
+        act_quit.setShortcut(QKeySequence.StandardKey.Quit)
         act_quit.triggered.connect(self.close)
         file_menu.addAction(act_quit)
 
-        m = self.menuBar().addMenu("&Device")
-        act_reload = QAction("&Refresh presets", self)
-        act_reload.triggered.connect(self._reload_presets)
-        m.addAction(act_reload)
+        preset_menu = self.menuBar().addMenu("&Preset")
+        act_p_rename = QAction("&Rename preset…", self)
+        act_p_rename.setShortcut(QKeySequence("Ctrl+R"))
+        act_p_rename.triggered.connect(self._preset_menu_rename)
+        preset_menu.addAction(act_p_rename)
+
+        preset_menu.addSeparator()
+        act_p_import = QAction("&Import preset…", self)
+        act_p_import.setShortcut(QKeySequence("Ctrl+I"))
+        act_p_import.triggered.connect(self._preset_menu_import)
+        preset_menu.addAction(act_p_import)
+
+        act_p_export = QAction("&Export preset…", self)
+        act_p_export.setShortcut(QKeySequence("Ctrl+E"))
+        act_p_export.triggered.connect(self._preset_menu_export)
+        preset_menu.addAction(act_p_export)
+
+        preset_menu.addSeparator()
+        act_p_reset = QAction("Re&set preset…", self)
+        act_p_reset.triggered.connect(self._preset_menu_reset)
+        preset_menu.addAction(act_p_reset)
 
     # --- connection ---
 
@@ -306,7 +346,7 @@ class MainWindow(QMainWindow):
 
     # --- loading a preset (click / ▴▾) ---
 
-    def _activate_preset(self, position: int) -> None:
+    def _activate_preset(self, position: int, on_done=None) -> None:
         if self._workers:
             return
         if self.midi is None:
@@ -338,7 +378,12 @@ class MainWindow(QMainWindow):
             # round-trip with active_preset_is_edited().
             return state, self.device.active_preset(), False
 
-        self._run(job, self._on_preset_loaded)
+        def handle_loaded(result):
+            self._on_preset_loaded(result)
+            if on_done is not None:
+                on_done()
+
+        self._run(job, handle_loaded)
 
     def _on_preset_loaded(self, result) -> None:
         state, pre, edited = result
@@ -450,6 +495,49 @@ class MainWindow(QMainWindow):
 
     # --- import/export ---
 
+    def _load_and_save_pgp_to_slot(self, slot: int, pgp: dict) -> None:
+        self.editor_view.load_pgp(pgp)
+        ed = self.editor_view.editor
+        name = self.editor_view.preset_name
+        slot_text = self._slot_text(slot)
+        setlist = self.current_setlist
+        self.statusBar().showMessage(f"Importing preset to slot {slot_text}…")
+
+        def job():
+            device = self.device
+            # 1. Switch pedal to the target slot first
+            if self.midi is not None:
+                self.midi.recall(setlist, slot)
+                for _ in range(RECALL_RETRIES):
+                    time.sleep(RECALL_SETTLE_S)
+                    state = device.active_state()
+                    if state.slot == slot:
+                        break
+
+            # 2. Upload the DSP chain/preset structure (op 21) containing all parameters
+            blob = ed.to_blob()
+            self._suppress_chain_echo += 1
+            device.write_chain_blob(blob)
+
+            # 3. Save the active edit buffer to target slot with the preset name (op 71)
+            device.save_preset(setlist, slot, name)
+            return ed
+
+        def on_done(ed):
+            self.librarian.update_preset_name(slot, name)
+            self.librarian.set_loaded(slot)
+            self.editor_view.set_preset(
+                ed,
+                name,
+                slot_text,
+                keep_state=False,
+                modified=False,
+            )
+            self.editor_view.mark_saved()
+            self._status(f"“{name}” imported to {slot_text} ✓")
+
+        self._run(job, on_done)
+
     def _import_preset_to(self, slot: int) -> None:
         """Import .pgp to the target slot: load editor + write to pedal + activate."""
         if self._workers:
@@ -459,42 +547,23 @@ class MainWindow(QMainWindow):
         pgp = self.editor_view._import_dialog()
         if pgp is None:
             return
-        self.editor_view.load_pgp(pgp)
-        setlist = self.current_setlist
-        name = self.editor_view.preset_name
-        self.statusBar().showMessage(f"Importing preset to slot {self._slot_text(slot)}…")
+        self._load_and_save_pgp_to_slot(slot, pgp)
 
-        def job():
-            device = self.device
-            ed = self.editor_view.editor
-            if ed is None:
-                return None
-            ok = device.save_preset(setlist, slot, name)
-            if not ok:
-                return None
-            if self.midi is not None:
-                self.midi.recall(setlist, slot)
-                for _ in range(RECALL_RETRIES):
-                    time.sleep(RECALL_SETTLE_S)
-                    state = device.active_state()
-                    if state.slot == slot:
-                        break
-            else:
-                state = device.active_state()
-            pre = device.active_preset()
-            edited = device.active_preset_is_edited()
-            return state, pre, edited
+    def _import_pgp_file_to(self, slot: int, path: str | Path) -> None:
+        """Import a specific .pgp file directly to target slot (e.g. from dropzone)."""
+        if self._workers:
+            return
+        if self.editor_view.modified and not self._confirm_discard():
+            return
+        from pathlib import Path
+        from ..preset import load_pgp
 
-        def on_done(result):
-            if result is None:
-                self.statusBar().showMessage("Error importing the preset")
-                return
-            state, pre, edited = result
-            self.librarian.set_loaded(state.slot)
-            self._show_preset(state, pre, edited)
-            self._status(f"Imported to {self._slot_text(slot)} ✓")
-
-        self._run(job, on_done)
+        try:
+            pgp = load_pgp(Path(path))
+        except Exception as exc:
+            QMessageBox.warning(self, "Error", f"Could not load the preset file:\n{exc}")
+            return
+        self._load_and_save_pgp_to_slot(slot, pgp)
 
     def _import_preset(self) -> None:
         """Import .pgp from the File menu into the currently loaded slot."""
@@ -506,9 +575,124 @@ class MainWindow(QMainWindow):
             return
         self._import_preset_to(slot)
 
+    def _target_slot_and_name(self) -> tuple[int | None, str | None]:
+        slot = self.librarian.current_slot()
+        if slot is None:
+            slot = self.librarian.loaded
+        if slot is None:
+            return None, None
+        name = self.librarian.preset_name(slot) or "Preset"
+        return slot, name
+
+    def _preset_menu_rename(self) -> None:
+        slot, name = self._target_slot_and_name()
+        if slot is not None and name is not None:
+            self._rename_preset(slot, name)
+
+    def _preset_menu_import(self) -> None:
+        slot, _ = self._target_slot_and_name()
+        if slot is not None:
+            self._import_preset_to(slot)
+
+    def _preset_menu_export(self) -> None:
+        slot, _ = self._target_slot_and_name()
+        if slot is not None:
+            self._export_preset_at(slot)
+
+    def _preset_menu_reset(self) -> None:
+        slot, _ = self._target_slot_and_name()
+        if slot is not None:
+            self._reset_preset(slot)
+
     def _export_preset(self) -> None:
-        """Export .pgp from the File menu."""
+        """Export .pgp from the File or Preset menu."""
         self.editor_view._export_dialog()
+
+    def _export_preset_at(self, slot: int) -> None:
+        if self._workers:
+            return
+        if slot == self.librarian.loaded and self.editor_view.editor is not None:
+            self._export_preset()
+        else:
+            self._activate_preset(slot, on_done=self._export_preset)
+
+    def _rename_preset(self, slot: int, current_name: str) -> None:
+        """Trigger in-place rename in the librarian list."""
+        self.librarian.start_rename_slot(slot)
+
+    def _on_toolbar_rename(self, new_name: str) -> None:
+        slot = self.librarian.loaded
+        if slot is None:
+            return
+        self._commit_preset_rename(slot, new_name)
+
+    def _commit_preset_rename(self, slot: int, new_name: str) -> None:
+        if self._workers:
+            QTimer.singleShot(100, lambda: self._commit_preset_rename(slot, new_name))
+            return
+        current_name = self.librarian.preset_name(slot) or ""
+        if new_name == current_name:
+            return
+        slot_text = self._slot_text(slot)
+        setlist = self.current_setlist
+
+        def job():
+            self.device.save_preset(setlist, slot, new_name)
+            return self.device.active_state(), self.device.active_preset()
+
+        def on_done(res):
+            state, pre = res
+            self.librarian.update_preset_name(slot, new_name)
+            if slot == self.librarian.loaded:
+                self.editor_view.set_preset_name(new_name)
+                self.editor_view.modified = False
+            self.statusBar().showMessage(f"Renamed preset {slot_text} to “{new_name}”")
+
+        self._run(job, on_done)
+
+    def _reset_preset(self, slot: int) -> None:
+        if self._workers:
+            return
+        slot_text = self._slot_text(slot)
+        current_name = self.librarian.preset_name(slot) or "Preset"
+        reply = QMessageBox.question(
+            self,
+            "Reset Preset",
+            f"Are you sure you want to reset preset {slot_text} (“{current_name}”) back to 'New Preset'?\n\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        setlist = self.current_setlist
+
+        def job():
+            if self.midi is not None:
+                self.midi.recall(setlist, slot)
+                time.sleep(RECALL_SETTLE_S)
+            pgp = preset.new_preset_dict("New Preset")
+            ed, _warnings = PresetEditor.from_pgp(pgp)
+            blob = ed.to_blob()
+            self._suppress_chain_echo += 1
+            self.device.write_chain_blob(blob)
+            self.device.save_preset(setlist, slot, "New Preset")
+            return ed
+
+        def on_done(ed):
+            self.librarian.set_loaded(slot)
+            self.librarian.update_preset_name(slot, "New Preset")
+            self.editor_view.set_preset(
+                ed,
+                "New Preset",
+                slot_text,
+                keep_state=False,
+                modified=False,
+            )
+            self.editor_view.mark_saved()
+            self.statusBar().showMessage(f"Reset preset {slot_text} to “New Preset”")
+
+        self._run(job, on_done)
 
     # --- backup and restore (.pgb) & archive (.zip) ---
 
@@ -830,7 +1014,6 @@ class MainWindow(QMainWindow):
         worker = self._run_progress(job, on_done, on_progress)
         worker.failed.connect(lambda exc: progress.close())
 
-
     # --- writing to the pedal ---
 
     @staticmethod
@@ -886,6 +1069,7 @@ class MainWindow(QMainWindow):
                 # Saved OK: clears the unsaved-changes indicator (●), so the
                 # discard dialog does not pop up when switching presets.
                 self.editor_view.mark_saved()
+                self.librarian.update_preset_name(slot, name)
                 self._status(
                     f"“{name}” saved to slot {self._slot_text(slot)} ✓"
                 )
@@ -1044,11 +1228,24 @@ class MainWindow(QMainWindow):
         midi_txt = f"MIDI {self.midi.port}" if self.midi else "MIDI not available"
         self.statusBar().showMessage(f"{self._info}  ·  {tail}  ·  {midi_txt}")
 
+    def _push_busy(self) -> None:
+        self._busy_depth = getattr(self, "_busy_depth", 0) + 1
+        if self._busy_depth == 1:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+    def _pop_busy(self) -> None:
+        self._busy_depth = getattr(self, "_busy_depth", 0) - 1
+        if self._busy_depth <= 0:
+            self._busy_depth = 0
+            while QApplication.overrideCursor() is not None:
+                QApplication.restoreOverrideCursor()
+
     def _run(self, fn, on_done) -> None:
         # The reader shares the USB: it is paused while a Worker runs and
         # resumed when it finishes (finished fires on success and on failure).
         if self._notification_reader is not None:
             self._notification_reader.pause()
+        self._push_busy()
         worker = Worker(fn)
         worker.setParent(self)
         worker.done.connect(on_done)
@@ -1057,6 +1254,7 @@ class MainWindow(QMainWindow):
         def _cleanup(w=worker):
             self._workers.discard(w)
             w.deleteLater()
+            self._pop_busy()
             if self._notification_reader is not None:
                 self._notification_reader.resume()
             self._flush_pending_chain_write()
@@ -1089,10 +1287,10 @@ class MainWindow(QMainWindow):
         worker.start()
         return worker
 
-
     def closeEvent(self, event) -> None:
         # Do not let a worker's cleanup flush a queued write during teardown.
         self._chain_write_pending = False
+        self._pop_busy()
         if self._notification_reader is not None:
             self._notification_reader.stop()
             self._notification_reader.wait(1000)
@@ -1104,17 +1302,76 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def run() -> int:
-    import os
-    level = os.environ.get("PODGO_LOGLEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=getattr(logging, level, logging.INFO),
-        format="%(relativeCreated)7.0fms %(levelname)s %(name)s: %(message)s",
+def _parse_args(argv: list[str] | None = None):
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        prog="openpodgo",
+        description="Open-source editor for the Line 6 POD Go on Linux.",
     )
-    app = QApplication.instance() or QApplication([])
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output (INFO level logging).",
+    )
+    parser.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="Enable debug output (DEBUG level logging).",
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress non-error output (ERROR level logging only).",
+    )
+    return parser.parse_args(argv if argv is not None else sys.argv[1:])
+
+
+def _get_log_level(args) -> int:
+    import os
+
+    if args.debug:
+        return logging.DEBUG
+    elif args.verbose:
+        return logging.INFO
+    elif args.quiet:
+        return logging.ERROR
+    else:
+        env_level = os.environ.get("PODGO_LOGLEVEL", "WARNING").upper()
+        return getattr(logging, env_level, logging.WARNING)
+
+
+def run(argv: list[str] | None = None) -> int:
+    import signal
+    import sys
+
+    args = _parse_args(argv)
+    log_level = _get_log_level(args)
+
+    logging.basicConfig(
+        level=log_level,
+        format="%(relativeCreated)7.0fms %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+
+    # Enable terminal Ctrl+C (SIGINT) to terminate process immediately
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    # Let Qt event loop periodically yield so OS signals like SIGINT trigger
+    sig_timer = QTimer()
+    sig_timer.timeout.connect(lambda: None)
+    sig_timer.start(200)
+
     apply_dark_theme(app)
     win = MainWindow()
     win.show()
     win.raise_()
     win.activateWindow()
     return app.exec()
+
