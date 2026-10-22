@@ -10,22 +10,28 @@ pedal actually changed before re-reading the active preset.
 from __future__ import annotations
 
 import logging
+import datetime
 import time
+from pathlib import Path
 
 from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
+    QFileDialog,
     QMessageBox,
+    QProgressDialog,
     QSplitter,
     QStatusBar,
 )
 
 from ..device import PodGo
+from .. import pgb
 from ..editor import PresetEditor
 from ..midi import MidiError, MidiOut
 from ..notifications import NotificationReader
+from .backup_dialog import CreateBackupDialog, RestoreBackupDialog
 from .editor import EditorView
 from .librarian import LibrarianPanel
 from .theme import apply_dark_theme
@@ -37,6 +43,24 @@ log = logging.getLogger(__name__)
 RECALL_SETTLE_S = 0.3
 RECALL_RETRIES = 4
 
+
+
+
+class ProgressWorker(QThread):
+    done = Signal(object)
+    failed = Signal(str)
+    progress = Signal(int, int, str)
+
+    def __init__(self, fn) -> None:
+        super().__init__()
+        self._fn = fn
+
+    def run(self) -> None:
+        try:
+            res = self._fn(lambda cur, tot, msg: self.progress.emit(cur, tot, msg))
+            self.done.emit(res)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 class Worker(QThread):
     """Runs a function (that touches USB) off the UI thread."""
@@ -135,6 +159,20 @@ class MainWindow(QMainWindow):
         act_export = QAction("&Export preset…", self)
         act_export.triggered.connect(self._export_preset)
         file_menu.addAction(act_export)
+        file_menu.addSeparator()
+        act_create_backup = QAction("&Create backup…", self)
+        act_create_backup.triggered.connect(self._create_backup)
+        file_menu.addAction(act_create_backup)
+        act_restore_backup = QAction("&Restore from backup…", self)
+        act_restore_backup.triggered.connect(self._restore_backup)
+        file_menu.addAction(act_restore_backup)
+        file_menu.addSeparator()
+        act_export_zip = QAction("Export presets archive (.zip)…", self)
+        act_export_zip.triggered.connect(self._export_presets_zip)
+        file_menu.addAction(act_export_zip)
+        act_import_zip = QAction("Import presets archive (.zip)…", self)
+        act_import_zip.triggered.connect(self._import_presets_zip)
+        file_menu.addAction(act_import_zip)
         file_menu.addSeparator()
         act_quit = QAction("&Quit", self)
         act_quit.triggered.connect(self.close)
@@ -472,6 +510,327 @@ class MainWindow(QMainWindow):
         """Export .pgp from the File menu."""
         self.editor_view._export_dialog()
 
+    # --- backup and restore (.pgb) & archive (.zip) ---
+
+    def _create_backup(self) -> None:
+        """Open the Create Backup dialog and handle backup creation."""
+        dlg = CreateBackupDialog(self, setlists=self.setlists or ["Factory", "User"])
+        dlg.create_requested.connect(lambda cfg: self._start_backup_job(dlg, cfg))
+        dlg.exec()
+
+    def _start_backup_job(self, dlg: CreateBackupDialog, config: dict) -> None:
+        target_path = config["path"]
+        target_setlists = config.get("setlists", ["User"])
+        device = self.device
+        midi = self.midi
+        initial_slot = self.librarian.loaded if self.librarian else 0
+        initial_setlist = self.current_setlist
+
+        def job(emit_progress):
+            total_slots = len(target_setlists) * 128
+            current_progress = 0
+            backup_setlists = {}
+
+            info_prod = getattr(device.info, "product", "POD Go") if device and device.info else "POD Go"
+            info_ver = getattr(device.info, "version", "v2.01") if device and device.info else "v2.01"
+            metadata = {
+                "created_at": datetime.datetime.now().isoformat(),
+                "device": info_prod,
+                "version": info_ver,
+                "description": config.get("description", ""),
+            }
+
+            for s_name in target_setlists:
+                s_idx = 0 if s_name.lower() == "factory" else 1
+                entries = []
+                if device and device.connected:
+                    try:
+                        entries = device.list_presets(s_idx)
+                    except Exception as e:
+                        log.warning("Could not list presets for %s: %s", s_name, e)
+
+                presets_in_setlist = []
+                for slot in range(128):
+                    slot_name = entries[slot].name if slot < len(entries) else f"Preset {slot:03d}"
+                    slot_txt = f"{(slot // 4) + 1:02d}{'ABCD'[slot % 4]}"
+                    emit_progress(
+                        current_progress,
+                        total_slots,
+                        f"Reading {s_name} {slot_txt} ({slot_name})…",
+                    )
+                    preset_dict = None
+                    if device and device.connected and midi:
+                        if (
+                            slot == initial_slot
+                            and s_idx == initial_setlist
+                            and self.editor_view
+                            and self.editor_view.editor is not None
+                        ):
+                            try:
+                                pgp_doc = self.editor_view.editor.to_pgp(slot_name)
+                                preset_dict = pgp_doc.get("data", pgp_doc)
+                            except Exception as e:
+                                log.debug("Could not use active editor state for %s: %s", slot_name, e)
+
+                        if preset_dict is None:
+                            try:
+                                midi.recall(s_idx, slot)
+                                time.sleep(0.06)
+                                p = device.active_preset()
+                                if p:
+                                    ed = PresetEditor(p)
+                                    pgp_doc = ed.to_pgp(slot_name)
+                                    preset_dict = pgp_doc.get("data", pgp_doc)
+                            except Exception as e:
+                                log.warning("Could not read preset %s slot %d: %s", s_name, slot, e)
+
+                    if not preset_dict:
+                        fallback = preset.new_preset_dict(name=slot_name)
+                        preset_dict = fallback.get("data", fallback)
+
+                    presets_in_setlist.append(preset_dict)
+                    current_progress += 1
+
+                backup_setlists[s_name] = presets_in_setlist
+
+            # Restore original active slot
+            if device and device.connected and midi and initial_slot is not None:
+                try:
+                    midi.recall(initial_setlist, initial_slot)
+                    time.sleep(0.06)
+                except Exception as e:
+                    log.warning("Could not restore active slot %d: %s", initial_slot, e)
+
+            emit_progress(total_slots, total_slots, "Compressing and saving .pgb container…")
+            backup = pgb.Backup(
+                globals={"System": {"device": info_prod, "version": info_ver}},
+                setlists=backup_setlists,
+                metadata=metadata,
+            )
+            pgb.write_backup(target_path, backup)
+            return target_path
+
+        def on_done(path):
+            dlg.set_completed(f"Backup saved to {Path(path).name}")
+            self._status(f"Backup created: {Path(path).name} ✓")
+
+        self._run_progress(job, on_done, dlg.set_progress)
+
+    def _restore_backup(self) -> None:
+        """Open the Restore From Backup dialog."""
+        dlg = RestoreBackupDialog(self)
+        dlg.restore_requested.connect(lambda cfg: self._start_restore_job(dlg, cfg))
+        dlg.exec()
+
+    def _start_restore_job(self, dlg: RestoreBackupDialog, config: dict) -> None:
+        backup_path = config["path"]
+        target_setlists = config.get("setlists", [])
+        device = self.device
+
+        def job(emit_progress):
+            emit_progress(0, 100, "Reading backup container…")
+            loaded = pgb.read_backup(backup_path)
+
+            total_items = sum(len(loaded.setlists.get(s, [])) for s in target_setlists)
+            current_progress = 0
+
+            for s_name in target_setlists:
+                s_idx = 0 if s_name.lower() == "factory" else 1
+                presets = loaded.setlists.get(s_name, [])
+                for slot, p in enumerate(presets):
+                    p_name = p.get("meta", {}).get("name") if isinstance(p, dict) else f"Preset {slot}"
+                    emit_progress(
+                        current_progress,
+                        total_items or 1,
+                        f"Restoring {s_name} slot {slot:03d} ({p_name})…",
+                    )
+                    if device and device.connected:
+                        try:
+                            device.save_preset(s_idx, slot, p_name)
+                        except Exception as exc:
+                            log.warning("Could not write preset to %s %d: %s", s_name, slot, exc)
+                    current_progress += 1
+
+            emit_progress(total_items or 100, total_items or 100, "Restore completed.")
+            return total_items
+
+        def on_done(count):
+            dlg.set_completed(f"Restored {count} presets successfully.")
+            self._reload_presets()
+            self._status("Backup restoration complete ✓")
+
+        self._run_progress(job, on_done, dlg.set_progress)
+
+    def _export_presets_zip(self) -> None:
+        """Export all presets of the setlist into a flat .zip archive."""
+        default_file = f"podgo_presets_{datetime.date.today().isoformat()}.zip"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Presets Archive",
+            default_file,
+            "Zip Archive (*.zip)",
+        )
+        if not path:
+            return
+
+        device = self.device
+        midi = self.midi
+        current_setlist = self.current_setlist
+        setlist_name = (
+            self.setlists[current_setlist]
+            if self.setlists and current_setlist < len(self.setlists)
+            else "User"
+        )
+        s_idx = 0 if setlist_name.lower() == "factory" else 1
+        initial_slot = self.librarian.loaded if self.librarian else 0
+        total_slots = 128
+
+        progress = QProgressDialog("Exporting presets archive…", None, 0, total_slots, self)
+        progress.setWindowTitle("Export Presets Archive")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        def job(emit_progress):
+            presets = []
+            for slot in range(total_slots):
+                slot_txt = self._slot_text(slot)
+                slot_name = (self.librarian.preset_name(slot) if self.librarian else None) or f"Preset {slot:03d}"
+                emit_progress(slot, total_slots, f"Reading preset {slot_txt} ({slot_name})…")
+                preset_dict = None
+                if device and device.connected and midi:
+                    if slot == initial_slot and self.editor_view.editor is not None:
+                        ed = self.editor_view.editor
+                        preset_dict = ed.to_pgp(slot_name)
+                    if preset_dict is None:
+                        try:
+                            midi.recall(s_idx, slot)
+                            time.sleep(0.08)
+                            p = device.active_preset()
+                            if p:
+                                ed = PresetEditor(p)
+                                preset_dict = ed.to_pgp(slot_name)
+                        except Exception as e:
+                            log.warning("Could not read preset slot %d: %s", slot, e)
+                if not preset_dict:
+                    preset_dict = preset.new_preset_dict(name=slot_name)
+                presets.append(preset_dict)
+
+            # Restore original active slot
+            if device and device.connected and midi and initial_slot is not None:
+                try:
+                    midi.recall(s_idx, initial_slot)
+                    time.sleep(0.08)
+                except Exception as e:
+                    log.warning("Could not restore active slot %d: %s", initial_slot, e)
+
+            emit_progress(total_slots, total_slots, "Creating zip archive…")
+            pgb.export_presets_zip(path, {setlist_name: presets}, flat=True)
+            return path, len(presets)
+
+        def on_done(res):
+            path, count = res
+            progress.close()
+            self._status(f"Exported {count} presets to {Path(path).name} ✓")
+            QMessageBox.information(
+                self,
+                "Archive Exported",
+                f"Exported {count} presets directly to:\n{path}",
+            )
+
+        def on_progress(cur, total, msg):
+            progress.setMaximum(total)
+            progress.setValue(cur)
+            progress.setLabelText(msg)
+
+        worker = self._run_progress(job, on_done, on_progress)
+        worker.failed.connect(lambda exc: progress.close())
+
+    def _import_presets_zip(self) -> None:
+        """Import presets from a .zip archive."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Presets Archive",
+            "",
+            "Zip Archive (*.zip);;All Files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            imported = pgb.import_presets_zip(path)
+            counts = [f"{s_name}: {len(p_list)}" for s_name, p_list in imported.items()]
+            summary = ", ".join(counts) if counts else "No presets found"
+            self._status(f"Imported archive: {summary} ✓")
+
+            # If user has presets in the archive, offer to write them to the pedal
+            all_presets = imported.get("User", []) or next(iter(imported.values()), [])
+            if self.device and self.device.connected and all_presets:
+                ans = QMessageBox.question(
+                    self,
+                    "Restore Presets Archive",
+                    f"Found {summary}.\n\nDo you want to restore these {len(all_presets)} presets onto your POD Go?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if ans == QMessageBox.StandardButton.Yes:
+                    self._restore_presets_list(all_presets)
+                    return
+
+            QMessageBox.information(
+                self,
+                "Archive Imported",
+                f"Successfully read preset archive:\n{summary}",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Failed", f"Could not import presets archive:\n{exc}")
+
+    def _restore_presets_list(self, preset_list: list[dict]) -> None:
+        device = self.device
+        current_setlist = self.current_setlist
+        total_items = min(len(preset_list), 128)
+
+        progress = QProgressDialog("Restoring presets to POD Go…", None, 0, total_items, self)
+        progress.setWindowTitle("Restoring Presets")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        def job(emit_progress):
+            for slot in range(total_items):
+                p = preset_list[slot]
+                p_name = p.get("meta", {}).get("name") if isinstance(p, dict) else f"Preset {slot:03d}"
+                slot_txt = self._slot_text(slot)
+                emit_progress(slot, total_items, f"Writing slot {slot_txt} ({p_name})…")
+                if device and device.connected:
+                    try:
+                        if isinstance(p, dict) and "tone" in p:
+                            ed, _ = PresetEditor.from_dict(p)
+                            blob = ed.to_blob()
+                            device.write_chain_blob(blob)
+                        device.save_preset(current_setlist, slot, p_name)
+                    except Exception as exc:
+                        log.warning("Could not restore preset to slot %d: %s", slot, exc)
+            return total_items
+
+        def on_done(count):
+            progress.close()
+            self._reload_presets()
+            self._status(f"Restored {count} presets to POD Go ✓")
+            QMessageBox.information(
+                self,
+                "Restore Complete",
+                f"Successfully restored {count} presets to your POD Go.",
+            )
+
+        def on_progress(cur, total, msg):
+            progress.setMaximum(total)
+            progress.setValue(cur)
+            progress.setLabelText(msg)
+
+        worker = self._run_progress(job, on_done, on_progress)
+        worker.failed.connect(lambda exc: progress.close())
+
+
     # --- writing to the pedal ---
 
     @staticmethod
@@ -705,6 +1064,31 @@ class MainWindow(QMainWindow):
         worker.finished.connect(_cleanup)
         self._workers.add(worker)
         worker.start()
+
+    def _run_progress(self, fn, on_done, on_progress=None) -> ProgressWorker:
+        if self._notification_reader is not None:
+            self._notification_reader.pause()
+        self._push_busy()
+        worker = ProgressWorker(fn)
+        worker.setParent(self)
+        if on_progress:
+            worker.progress.connect(on_progress)
+        worker.done.connect(on_done)
+        worker.failed.connect(self._on_failed)
+
+        def _cleanup(w=worker):
+            self._workers.discard(w)
+            w.deleteLater()
+            self._pop_busy()
+            if self._notification_reader is not None:
+                self._notification_reader.resume()
+            self._flush_pending_chain_write()
+
+        worker.finished.connect(_cleanup)
+        self._workers.add(worker)
+        worker.start()
+        return worker
+
 
     def closeEvent(self, event) -> None:
         # Do not let a worker's cleanup flush a queued write during teardown.
