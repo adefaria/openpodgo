@@ -2,7 +2,8 @@
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 REPO_DIR="$(CDPATH="" cd -- "$(dirname -- "$SCRIPT_PATH")/.." >/dev/null 2>&1 && pwd)"
 
-# Parse optional --scale (scales whole UI) or --font-scale (scales text only)
+# Parse optional --scale (scales whole UI, default 1.5) or --font-scale (scales text only)
+export QT_SCALE_FACTOR="1.5"
 ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in

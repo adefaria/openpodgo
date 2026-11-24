@@ -226,7 +226,7 @@ class MainWindow(QMainWindow):
     # --- connection ---
 
     def _start_connect(self) -> None:
-        if self._workers:
+        if self._busy_guard():
             return
         self.statusBar().showMessage("Connecting to the POD Go and reading presets…")
         try:
@@ -320,7 +320,7 @@ class MainWindow(QMainWindow):
         self._load_presets(self.current_setlist, sync_pedal=False)
 
     def _load_presets(self, setlist: int, sync_pedal: bool) -> None:
-        if self._workers:
+        if self._busy_guard():
             return  # a USB operation is already in progress
         name = (
             self.setlists[setlist]
@@ -347,7 +347,7 @@ class MainWindow(QMainWindow):
     # --- loading a preset (click / ▴▾) ---
 
     def _activate_preset(self, position: int, on_done=None) -> None:
-        if self._workers:
+        if self._busy_guard():
             return
         if self.midi is None:
             self.statusBar().showMessage(
@@ -496,7 +496,14 @@ class MainWindow(QMainWindow):
     # --- import/export ---
 
     def _load_and_save_pgp_to_slot(self, slot: int, pgp: dict) -> None:
-        self.editor_view.load_pgp(pgp)
+        try:
+            self.editor_view.load_pgp(pgp)
+        except Exception as exc:
+            self.statusBar().showMessage("Import failed", 5000)
+            QMessageBox.warning(
+                self, "Import Error", f"Could not load the preset:\n{exc}"
+            )
+            return
         ed = self.editor_view.editor
         name = self.editor_view.preset_name
         slot_text = self._slot_text(slot)
@@ -520,7 +527,10 @@ class MainWindow(QMainWindow):
             device.write_chain_blob(blob)
 
             # 3. Save the active edit buffer to target slot with the preset name (op 71)
-            device.save_preset(setlist, slot, name)
+            if not device.save_preset(setlist, slot, name):
+                raise RuntimeError(
+                    f"Pedal rejected saving preset {name!r} to {slot_text}"
+                )
             return ed
 
         def on_done(ed):
@@ -540,7 +550,7 @@ class MainWindow(QMainWindow):
 
     def _import_preset_to(self, slot: int) -> None:
         """Import .pgp to the target slot: load editor + write to pedal + activate."""
-        if self._workers:
+        if self._busy_guard():
             return
         if self.editor_view.modified and not self._confirm_discard():
             return
@@ -551,7 +561,7 @@ class MainWindow(QMainWindow):
 
     def _import_pgp_file_to(self, slot: int, path: str | Path) -> None:
         """Import a specific .pgp file directly to target slot (e.g. from dropzone)."""
-        if self._workers:
+        if self._busy_guard():
             return
         if self.editor_view.modified and not self._confirm_discard():
             return
@@ -609,7 +619,7 @@ class MainWindow(QMainWindow):
         self.editor_view._export_dialog()
 
     def _export_preset_at(self, slot: int) -> None:
-        if self._workers:
+        if self._busy_guard():
             return
         if slot == self.librarian.loaded and self.editor_view.editor is not None:
             self._export_preset()
@@ -651,7 +661,7 @@ class MainWindow(QMainWindow):
         self._run(job, on_done)
 
     def _reset_preset(self, slot: int) -> None:
-        if self._workers:
+        if self._busy_guard():
             return
         slot_text = self._slot_text(slot)
         current_name = self.librarian.preset_name(slot) or "Preset"
@@ -1046,7 +1056,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _save_to_pedal(self) -> None:
-        if self._workers:
+        if self._busy_guard():
             return
         slot = self.librarian.loaded
         if slot is None:
@@ -1227,6 +1237,13 @@ class MainWindow(QMainWindow):
     def _status(self, tail: str) -> None:
         midi_txt = f"MIDI {self.midi.port}" if self.midi else "MIDI not available"
         self.statusBar().showMessage(f"{self._info}  ·  {tail}  ·  {midi_txt}")
+
+    def _busy_guard(self) -> bool:
+        """Return True and notify the status bar if a USB worker is active."""
+        if not self._workers:
+            return False
+        self.statusBar().showMessage("Busy talking to the pedal — please wait…", 3000)
+        return True
 
     def _push_busy(self) -> None:
         self._busy_depth = getattr(self, "_busy_depth", 0) + 1
